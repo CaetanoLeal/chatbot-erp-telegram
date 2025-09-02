@@ -23,11 +23,11 @@ const apiHash = "030aaf9610ff135dd84423742007daf4";
 const sessions = {};
 const messages = [];
 
-// Função para salvar arquivo em "recebidos"
-async function salvarArquivo(buffer, nomeArquivo, mimetype) {
+// Função para salvar arquivo em "enviados" ou "recebidos"
+async function salvarArquivo(buffer, nomeArquivo, mimetype, pastaBase) {
   try {
     const pastaTipo = mimetype ? mimetype.split("/")[0] : "outros";
-    const dir = path.join(__dirname, "recebidos", pastaTipo);
+    const dir = path.join(__dirname, pastaBase, pastaTipo);
 
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -103,39 +103,52 @@ app.post("/nova-instancia", async (req, res) => {
       async (event) => {
         const message = event.message;
 
-        // Só texto → apenas webhook
+        // Checa se é texto puro
         if (message.text && !message.media) {
-          const msg = {
-            de: message.senderId?.toString(),
-            texto: message.text,
-            data: message.date,
-          };
-
-          messages.push(msg);
-          console.log("📩 Texto recebido:", msg.texto);
-
-          await sendWebhook(Webhook, {
-            acao: "mensagem_recebida",
-            mensagem: msg.texto,
-            remetente: msg.de,
-            mensagem_completa: msg,
-          });
+          // aqui você pode tratar mensagens de texto
         }
 
-        // Se tiver mídia → salva em recebidos e manda base64
+        // Se for mídia
         else if (message.media) {
           try {
+            // 1. Baixa a mídia
             const buffer = await client.downloadMedia(message.media, { workers: 1 });
-            const mimetype = message.media.document?.mimeType || "application/octet-stream";
-            const ext = mime.extension(mimetype) || "bin";
-            const nomeArquivo = `file_${Date.now()}.${ext}`;
 
-            const filePath = await salvarArquivo(buffer, nomeArquivo, mimetype);
+            // 2. Descobre nome do arquivo
+            let nomeArquivo;
+            let mimetype = "application/octet-stream";
+
+            if (message.media.document) {
+              mimetype = message.media.document.mimeType || mimetype;
+
+              // tenta pegar o nome original
+              const attr = message.media.document.attributes?.find((a) => a.fileName);
+              if (attr && attr.fileName) {
+                nomeArquivo = attr.fileName;
+              }
+            }
+
+            // fallback pelo mimetype
+            if (!nomeArquivo) {
+              const ext = mime.extension(mimetype) || "bin";
+              nomeArquivo = `file_${Date.now()}.${ext}`;
+            }
+
+            // 3. Define se foi enviado ou recebido
+            const remetente = message.senderId?.toString();
+            const me = await sessions[Nome].client.getMe();
+            const meuId = me.id.toString();
+            const pastaBase = remetente === meuId ? "enviados" : "recebidos";
+
+            // 4. Salva o arquivo
+            const filePath = await salvarArquivo(buffer, nomeArquivo, mimetype, pastaBase);
+
+            // 5. Converte em base64 para webhook
             const base64 = buffer.toString("base64");
 
             await sendWebhook(Webhook, {
               acao: "midia_recebida",
-              remetente: message.senderId?.toString(),
+              remetente,
               mimetype,
               arquivo: nomeArquivo,
               caminho: filePath,
