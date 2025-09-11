@@ -1,4 +1,3 @@
-// index.js (arquivo completo ajustado)
 const { NewMessage } = require("telegram/events");
 const express = require("express");
 const cors = require("cors");
@@ -29,11 +28,11 @@ const SESSIONS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
 // Tratamento de erros global do Node.js
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Rejeição não tratada em:', promise, 'motivo:', reason);
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("❌ Rejeição não tratada em:", promise, "motivo:", reason);
 });
-process.on('uncaughtException', (error) => {
-  console.error('❌ Exceção não tratada:', error);
+process.on("uncaughtException", (error) => {
+  console.error("❌ Exceção não tratada:", error);
   process.exit(1);
 });
 
@@ -53,26 +52,20 @@ async function salvarArquivo(buffer, nomeArquivo, mimetype, pastaBase) {
   }
 }
 
-// Função para enviar dados a um Webhook com retry
-async function sendWebhook(url, payload, retries = 3) {
+// Função para enviar dados a um Webhook (apenas uma tentativa)
+async function sendWebhook(url, payload) {
   if (!url) {
     console.log("⚠️ sendWebhook chamado sem URL. Ignorando.");
     return;
   }
-  for (let i = 0; i < retries; i++) {
-    try {
-      console.log(`🔄 Tentativa ${i + 1} para webhook: ${url}`);
-      await axios.post(url, payload, {
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        timeout: 15000,
-      });
-      console.log(`✅ Webhook enviado para: ${url}`);
-      return;
-    } catch (err) {
-      console.error(`❌ Erro na tentativa ${i + 1}:`, err.message);
-      if (i < retries - 1) await new Promise(resolve => setTimeout(resolve, 2000));
-      else console.error(`❌ Todas as tentativas falharam para: ${url}`);
-    }
+  try {
+    await axios.post(url, payload, {
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      timeout: 15000,
+    });
+    console.log(`✅ Webhook enviado para: ${url}`);
+  } catch (err) {
+    console.error(`❌ Erro ao enviar webhook (${url}):`, err.message);
   }
 }
 
@@ -113,8 +106,7 @@ async function tryExportLoginToken(client) {
       );
       return resp2;
     } catch (err2) {
-      const err = err2 || err1;
-      throw err;
+      throw err2 || err1;
     }
   }
 }
@@ -148,7 +140,6 @@ app.post("/nova-instancia", async (req, res) => {
     if (!Nome || !Webhook) return res.status(400).json({ error: "Nome e Webhook são obrigatórios" });
     if (sessions[Nome]) return res.json({ status: true, mensagem: "Sessão já existente", nome: Nome });
 
-    // tenta carregar session persistida
     const saved = readSavedSession(Nome);
     const stringSession = new StringSession(saved || "");
 
@@ -157,69 +148,69 @@ app.post("/nova-instancia", async (req, res) => {
       baseLogger: console,
     });
 
-    // Se existe session salva e válida, preferimos start() para restaurar
     if (saved) {
       console.log(`🔁 Encontrada session salva para "${Nome}", tentando restaurar...`);
-      await client.start({
-        // sem `qrCode` aqui — esperamos que a session seja válida
-      });
-
-      // se chegou aqui sem erro, estamos conectados e autorizados
+      await client.start(); // restaura e inicializa internamente
       const string = client.session.save();
       sessions[Nome] = { client, webhook: Webhook, stringSession: string };
       console.log(`✅ Instância "${Nome}" restaurada a partir da session salva.`);
-      // notifica webhook (async)
-      sendWebhook(Webhook, {
-        acao: "conexao_restaurada",
-        nome: Nome,
-        status: "conectado",
-        stringSession: string,
-        data: new Date().toISOString(),
-      }).catch(()=>{});
+      sendWebhook(Webhook, { acao: "conexao_restaurada", nome: Nome, status: "conectado", stringSession: string, data: new Date().toISOString() }).catch(()=>{});
       return res.json({ status: true, nome: Nome, mensagem: "Sessão restaurada a partir do arquivo." });
     }
 
-    // se não há session salva, procede com fluxo QR
+    // sem session salva -> fluxo QR
     await client.connect();
 
-    let lastExportToken = null;
     let qrRefreshTimer = null;
     let isAuthenticated = false;
+    const webhookLocal = Webhook; // captura local safe para handlers
 
-    // generate and show QR (and try webhook)
+    // handler de mensagens (só será registrado após autenticação)
+    const messageHandler = async (event) => {
+      try {
+        const msg = event.message;
+        const texto = msg?.message ?? "";
+        console.log("📩 Nova mensagem recebida:", texto);
+        messages.push({ remetente: String(msg.senderId ?? ""), texto, data: new Date().toISOString() });
+
+        // envia para webhook (usa webhookLocal)
+        sendWebhook(webhookLocal, {
+          acao: "mensagem_recebida",
+          de: msg.senderId?.toString(),
+          texto,
+          instancia: Nome,
+          data: new Date().toISOString(),
+        }).catch(()=>{});
+      } catch (err) {
+        console.error("Erro no messageHandler:", err);
+      }
+    };
+
+    // gerar QR e renovar
     const generateAndSendQR = async () => {
       if (isAuthenticated || (sessions[Nome] && sessions[Nome].client)) {
         console.log(`✅ Instância "${Nome}" já autenticada — não gerando QR.`);
         return null;
       }
-
       try {
         const exportResp = await tryExportLoginToken(client);
         if (!exportResp) throw new Error("exportLoginToken retornou vazio");
-
         const tokenBuf = tokenToBuffer(exportResp.token);
         if (!tokenBuf) throw new Error("Não foi possível extrair bytes do token retornado");
-
-        lastExportToken = tokenBuf;
         const b64url = toBase64Url(tokenBuf);
         const tgUrl = `tg://login?token=${b64url}`;
-
-        // Exibir OBRIGATORIAMENTE no terminal
         console.log("🔵 QR tg://login gerado (base64url):", tgUrl);
         qrcode.generate(tgUrl, { small: true });
-
-        // Tentar enviar para webhook, sem bloquear
-        sendWebhook(Webhook, {
+        // enviar para webhook
+        sendWebhook(webhookLocal, {
           acao: "qr_code_gerado",
           nome: Nome,
           qrUrl: tgUrl,
           expires: exportResp.expires,
           data: new Date().toISOString(),
-        }).catch(() => {
-          console.log("⚠️ Não foi possível enviar QR para o webhook. Continuando localmente.");
-        });
+        }).catch(()=>{ console.log("⚠️ Não foi possível enviar QR para o webhook."); });
 
-        // schedule refresh pouco antes de expirar
+        // agendar refresh (poucos segundos antes do expires)
         const nowSec = Math.floor(Date.now() / 1000);
         const expiresAt = exportResp.expires || (nowSec + 30);
         const msUntilRefresh = Math.max((expiresAt - nowSec - 3) * 1000, 5 * 1000);
@@ -235,108 +226,105 @@ app.post("/nova-instancia", async (req, res) => {
         return { tgUrl, expires: exportResp.expires };
       } catch (err) {
         console.error("❌ erro em generateAndSendQR:", err && err.message ? err.message : err);
-        sendWebhook(Webhook, {
-          acao: "erro_export_login_token",
-          nome: Nome,
-          erro: err && err.message ? err.message : String(err),
-          data: new Date().toISOString(),
-        }).catch(()=>{});
+        sendWebhook(webhookLocal, { acao: "erro_export_login_token", nome: Nome, erro: err && err.message ? err.message : String(err), data: new Date().toISOString() }).catch(()=>{});
         return null;
       }
     };
 
-    // handler robusto: loga update cru e detecta login token updates
+    // update handler — observa eventos de login
     const updateHandler = async (update) => {
+    try {
+      // log completo do update (vai te mostrar exatamente a estrutura)
+      console.log("🔔 Update recebido (full):", util.inspect(update, { depth: 6, colors: false }));
+
+      // detecta se o update tem cara de login token (expandir conforme necessário)
+      const looksLikeLoginUpdate = (u) => {
+        if (!u) return false;
+        if (typeof u._ === "string" && u._.toLowerCase().includes("logintoken")) return true;
+        if (u.loginToken || u.login_token) return true;
+        if (u.update && typeof u.update._ === "string" && u.update._.toLowerCase().includes("logintoken")) return true;
+        if (u.updates && Array.isArray(u.updates)) {
+          return u.updates.some(it => it && it._ && typeof it._ === "string" && it._.toLowerCase().includes("logintoken"));
+        }
+        return false;
+      };
+
+      if (!looksLikeLoginUpdate(update)) return;
+
+      console.log("🔎 Parece um login-token update — tentando confirmar com exportLoginToken...");
+
+      let confirm;
       try {
-        console.log("🔔 Update bruto recebido:", util.inspect(update, { depth: 6, colors: false }));
-
-        const looksLikeLoginUpdate = (u) => {
-          if (!u) return false;
-          if (u._ && typeof u._ === 'string' && u._.toLowerCase().includes('logintoken')) return true;
-          if (u.loginToken || u.login_token) return true;
-          if (u.update && u.update._ && typeof u.update._ === 'string' && u.update._.toLowerCase().includes('logintoken')) return true;
-          if (u.updates && Array.isArray(u.updates)) {
-            return u.updates.some(it => it && it._ && typeof it._ === 'string' && it._.toLowerCase().includes('logintoken'));
-          }
-          if (u.short && u.short._ && typeof u.short._ === 'string' && u.short._.toLowerCase().includes('logintoken')) return true;
-          return false;
-        };
-
-        if (!looksLikeLoginUpdate(update)) return;
-
-        console.log("🔎 Detected potential login-token update. Attempting confirmation...");
-
-        let confirm;
-        try {
-          confirm = await tryExportLoginToken(client);
-          console.log(">>> confirm (exportLoginToken) response:", util.inspect(confirm, { depth: 6 }));
-        } catch (err) {
-          console.error("❌ erro ao re-confirmar exportLoginToken:", err && err.message ? err.message : err);
-          sendWebhook(Webhook, { acao: "erro_confirm_export", nome: Nome, erro: err.message || String(err) }).catch(()=>{});
-          return;
-        }
-
-        if (confirm && confirm._ === "auth.loginTokenSuccess") {
-          console.log("✅ loginTokenSuccess recebido — sessão autorizada!");
-          isAuthenticated = true;
-          const string = client.session.save();
-          sessions[Nome] = { client, webhook: Webhook, stringSession: string };
-          saveSessionToDisk(Nome, string);
-
-          if (qrRefreshTimer) { clearTimeout(qrRefreshTimer); qrRefreshTimer = null; }
-
-          sendWebhook(Webhook, {
-            acao: "conexao_estabelecida",
-            nome: Nome,
-            status: "conectado",
-            stringSession: string,
-            data: new Date().toISOString(),
-          }).catch(()=>{ console.log("⚠️ Não foi possível notificar webhook da conexão."); });
-
-          console.log(`🚀 Instância "${Nome}" pronta. Você pode usar /send-message agora.`);
-          try { client.removeEventHandler(updateHandler); } catch(e){}
-
-        } else if (confirm && confirm._ === "auth.loginTokenMigrateTo") {
-          console.log("➡️ loginTokenMigrateTo recebido — migrando DC...", confirm);
-          try {
-            const importResp = await client.invoke(new Api.auth.ImportLoginToken({ token: confirm.token }));
-            console.log(">>> importResp:", util.inspect(importResp, { depth: 6 }));
-
-            if (importResp && importResp._ === "auth.loginTokenSuccess") {
-              console.log("✅ importLoginToken -> loginTokenSuccess — sessão autorizada!");
-              isAuthenticated = true;
-              const string = client.session.save();
-              sessions[Nome] = { client, webhook: Webhook, stringSession: string };
-              saveSessionToDisk(Nome, string);
-              if (qrRefreshTimer) { clearTimeout(qrRefreshTimer); qrRefreshTimer = null; }
-
-              sendWebhook(Webhook, {
-                acao: "conexao_estabelecida",
-                nome: Nome,
-                status: "conectado",
-                stringSession: string,
-                data: new Date().toISOString(),
-              }).catch(()=>{});
-
-              console.log(`🚀 Instância "${Nome}" pronta (import). Você pode usar /send-message agora.`);
-              try { client.removeEventHandler(updateHandler); } catch(e){}
-            } else {
-              console.log("⚠️ importLoginToken retornou:", importResp);
-              sendWebhook(Webhook, { acao: "erro_import_login_token", nome: Nome, detalhe: importResp }).catch(()=>{});
-            }
-          } catch (err) {
-            console.error("❌ erro ao chamar importLoginToken:", err);
-            sendWebhook(Webhook, { acao: "erro_import_login_token", nome: Nome, erro: err.message }).catch(()=>{});
-          }
-        } else {
-          console.log("ℹ️ resposta inesperada ao confirmar token:", util.inspect(confirm, { depth: 6 }));
-          sendWebhook(Webhook, { acao: "resposta_inesperada_confirmar_token", nome: Nome, resposta: confirm }).catch(()=>{});
-        }
+        confirm = await tryExportLoginToken(client);
+        console.log(">>> confirm (full):", util.inspect(confirm, { depth: 6, colors: false }));
       } catch (err) {
-        console.error("❌ erro no updateHandler:", err);
+        console.error("❌ erro ao re-confirmar exportLoginToken:", err && err.message ? err.message : err);
+        sendWebhook(webhookLocal, { acao: "erro_confirm_export", nome: Nome, erro: String(err) }).catch(()=>{});
+        return;
       }
-    };
 
+      // Caso já seja um sucesso explícito
+     // quando confirm traz token -> converte e importa corretamente
+      if (confirm && (confirm.token || confirm.login_token)) {
+        console.log("➡️ confirm trouxe token — tentando ImportLoginToken automaticamente...");
+        try {
+          const raw = confirm.token || confirm.login_token;
+          const tokenBuf = tokenToBuffer(raw) || raw; // garante Buffer quando possível
+          const importResp = await client.invoke(new Api.auth.ImportLoginToken({ token: tokenBuf }));
+          console.log(">>> importResp (full):", util.inspect(importResp, { depth: 6, colors: false }));
+          if (importResp && (importResp._ === "auth.loginTokenSuccess" || String(importResp._).toLowerCase().includes("logintokensuccess"))) {
+            // sucesso: salvar session, registrar handler, limpar timer (mesma lógica sua)
+          } else {
+            console.log("⚠️ importLoginToken não retornou success:", util.inspect(importResp, { depth: 2 }));
+            sendWebhook(webhookLocal, { acao: "erro_import_login_token", nome: Nome, detalhe: importResp }).catch(()=>{});
+          }
+        } catch (err) {
+          console.error("❌ erro ao chamar ImportLoginToken:", err);
+          sendWebhook(webhookLocal, { acao: "erro_import_login_token", nome: Nome, erro: String(err) }).catch(()=>{});
+        }
+      }
+
+
+      // Caso venha um objeto com token para importar (migrateTo flow ou similar) - tentar importar
+      if (confirm && (confirm.token || confirm.login_token)) {
+        console.log("➡️ confirm trouxe token — tentando ImportLoginToken automaticamente...");
+        try {
+          const importResp = await client.invoke(new Api.auth.ImportLoginToken({ token: confirm.token || confirm.login_token }));
+          console.log(">>> importResp (full):", util.inspect(importResp, { depth: 6, colors: false }));
+          if (importResp && (importResp._ === "auth.loginTokenSuccess" || String(importResp._).toLowerCase().includes("logintokensuccess"))) {
+            console.log("✅ importLoginToken -> loginTokenSuccess — sessão autorizada!");
+            isAuthenticated = true;
+            const string = client.session.save();
+            sessions[Nome] = { client, webhook: webhookLocal, stringSession: string };
+            saveSessionToDisk(Nome, string);
+            if (qrRefreshTimer) { clearTimeout(qrRefreshTimer); qrRefreshTimer = null; }
+            try {
+              client.addEventHandler(messageHandler, new NewMessage({}));
+              console.log("✅ messageHandler registrado (após import).");
+            } catch (e) { console.error("Erro registrando messageHandler após import:", e); }
+            sendWebhook(webhookLocal, { acao: "conexao_estabelecida", nome: Nome, status: "conectado", stringSession: string, data: new Date().toISOString() }).catch(()=>{});
+            try { client.removeEventHandler(updateHandler); } catch(e){}
+            return;
+          } else {
+            console.log("⚠️ importLoginToken não retornou success:", util.inspect(importResp, { depth: 2 }));
+            sendWebhook(webhookLocal, { acao: "erro_import_login_token", nome: Nome, detalhe: importResp }).catch(()=>{});
+          }
+        } catch (err) {
+          console.error("❌ erro ao chamar ImportLoginToken:", err);
+          sendWebhook(webhookLocal, { acao: "erro_import_login_token", nome: Nome, erro: String(err) }).catch(()=>{});
+        }
+      }
+
+      // Se nada disso disparou, logamos e avisamos webhook — isso ajuda a entender o formato retornado
+      console.log("ℹ️ Nao foi possível confirmar login automaticamente. Confirm object e update foram enviados ao webhook para análise.");
+      sendWebhook(webhookLocal, { acao: "resposta_inesperada_confirmar_token", nome: Nome, confirm, update }).catch(()=>{});
+
+    } catch (err) {
+      console.error("❌ erro no updateHandler:", err);
+    }
+  };
+
+    // registrar updateHandler (antes do QR)
     client.addEventHandler(updateHandler);
 
     // gera o primeiro QR
