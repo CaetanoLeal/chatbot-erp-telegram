@@ -1,39 +1,38 @@
+const { Api, TelegramClient } = require("telegram");
 const { NewMessage } = require("telegram/events");
+const { StringSession } = require("telegram/sessions");
 const express = require("express");
 const cors = require("cors");
-const { Api, TelegramClient } = require("telegram");
-const { StringSession } = require("telegram/sessions");
-const input = require("input");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
-const qrcode = require("qrcode-terminal");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3002;
 
 // Credenciais Telegram
 const apiId = 20637774;
 const apiHash = "030aaf9610ff135dd84423742007daf4";
 
-// Pasta para persistir sessões
+// Diretório de sessões
 const SESSIONS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
 // Sessões em memória
 const sessions = {};
+const tempLogins = {}; // guarda { phoneNumber: { client, phoneCodeHash } }
 const messages = [];
 
-/* -------------------- Funções Utilitárias -------------------- */
+/* -------------------- Funções utilitárias -------------------- */
 
 async function sendWebhook(url, payload) {
   if (!url) return;
   try {
     await axios.post(url, payload, { headers: { "Content-Type": "application/json" }, timeout: 10000 });
-    console.log("✅ Webhook enviado:", payload.acao);
+    console.log("✅ Webhook enviado:", payload.acao || "mensagem");
   } catch (err) {
     console.error("❌ Erro ao enviar webhook:", err.message);
   }
@@ -42,7 +41,7 @@ async function sendWebhook(url, payload) {
 function saveSession(nome, stringSession) {
   const file = path.join(SESSIONS_DIR, `${nome}.session`);
   fs.writeFileSync(file, stringSession, "utf8");
-  console.log("💾 StringSession salva:", file);
+  console.log("💾 Sessão salva:", file);
 }
 
 function readSession(nome) {
@@ -51,114 +50,193 @@ function readSession(nome) {
   return null;
 }
 
-/* -------------------- Endpoints -------------------- */
+/* -------------------- Login em duas etapas -------------------- */
 
-// Criar nova instância via client.start (login por telefone)
-app.post("/nova-instancia", async (req, res) => {
+// Etapa 1: iniciar login (envia código para o Telegram)
+app.post("/iniciar-login", async (req, res) => {
+  const { nome, webhook, phoneNumber } = req.body;
+  if (!nome || !phoneNumber) return res.status(400).json({ error: "nome e phoneNumber são obrigatórios" });
+
   try {
-    const { Nome, Webhook, phoneNumber } = req.body;
-    if (!Nome || !Webhook || !phoneNumber)
-      return res.status(400).json({ error: "Nome, Webhook e phoneNumber são obrigatórios" });
-
-    if (sessions[Nome]) return res.json({ status: true, mensagem: "Sessão já existente" });
-
-    const savedSession = readSession(Nome);
-    const stringSession = new StringSession(savedSession || "");
-    const client = new TelegramClient(stringSession, apiId, apiHash, { connectionRetries: 5 });
-
-    const messageHandler = async (event) => {
-      const msg = event.message;
-      const texto = msg?.message ?? "";
-      messages.push({ remetente: String(msg.senderId ?? ""), texto, data: new Date().toISOString() });
-      sendWebhook(Webhook, {
-        acao: "mensagem_recebida",
-        de: msg.senderId?.toString(),
-        texto,
-        instancia: Nome,
-        data: new Date().toISOString(),
-      });
-    };
-    client.addEventHandler(messageHandler, new NewMessage({}));
-
-    await client.start({
-      phoneNumber: async () => phoneNumber,
-      phoneCode: async () => await input.text("Digite o código recebido no Telegram: "),
-      password: async () => await input.text("Digite a senha 2FA (se houver): "),
-      onError: (err) => console.log("❌ Erro no start:", err),
-    });
-
-    const string = client.session.save();
-    saveSession(Nome, string);
-
-    sessions[Nome] = { client, webhook: Webhook, stringSession: string, isConfirmed: true };
-
-    console.log(`✅ Sessão iniciada: ${Nome}`);
-    sendWebhook(Webhook, {
-      acao: "sessao_iniciada",
-      nome: Nome,
-      status: "conectado",
-      data: new Date().toISOString(),
-    });
-
-    res.json({ status: true, nome: Nome, mensagem: "Sessão iniciada com sucesso" });
-  } catch (err) {
-    console.error("❌ Erro ao criar instância:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Criar QR code separado
-app.post("/qrcode", async (req, res) => {
-  try {
-    const { Nome, Webhook } = req.body;
-    if (!Nome || !Webhook) return res.status(400).json({ error: "Nome e Webhook são obrigatórios" });
-
-    if (sessions[Nome]) return res.json({ status: true, mensagem: "Sessão já existente" });
-
     const stringSession = new StringSession("");
     const client = new TelegramClient(stringSession, apiId, apiHash, { connectionRetries: 5 });
     await client.connect();
 
-    const exportResp = await client.invoke(new Api.auth.ExportLoginToken({ apiId, apiHash, exceptIds: [] }));
-    const b64url = Buffer.from(exportResp.token)
-      .toString("base64")
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
-    const tgUrl = `tg://login?token=${b64url}`;
-    qrcode.generate(tgUrl, { small: true });
+    console.log(`📞 Enviando código para ${phoneNumber}...`);
+    const result = await client.sendCode({ apiId, apiHash }, phoneNumber);
 
-    sessions[Nome] = { client, webhook: Webhook, stringSession: "", isConfirmed: false };
-
-    sendWebhook(Webhook, {
-      acao: "qr_code_gerado",
-      nome: Nome,
-      qrUrl: tgUrl,
-      data: new Date().toISOString(),
-    });
-
-    res.json({ status: true, nome: Nome, mensagem: "QR Code gerado — exibido no terminal" });
+    tempLogins[phoneNumber] = { client, phoneCodeHash: result.phoneCodeHash, nome, webhook };
+    res.json({ status: "aguardando_codigo", phoneNumber });
   } catch (err) {
-    console.error("❌ Erro ao gerar QR code:", err);
-    res.status(500).json({ error: err.message });
+    console.error("❌ Erro iniciar login:", err);
+    res.status(500).json({ error: "Falha ao enviar código" });
   }
 });
 
-// Enviar mensagem
-app.post("/send-message", async (req, res) => {
+// Etapa 2: confirmar código recebido
+app.post("/confirmar-codigo", async (req, res) => {
+  const { phoneNumber, phoneCode, password } = req.body;
+  const loginData = tempLogins[phoneNumber];
+  if (!loginData) return res.status(400).json({ error: "Sessão de login não encontrada" });
+
+  const { client, phoneCodeHash, nome, webhook } = loginData;
+
   try {
-    const { nome, number, message } = req.body;
-    const session = sessions[nome];
-    if (!session) return res.status(400).json({ error: "Sessão não encontrada" });
-    if (!session.isConfirmed) return res.status(400).json({ error: "Sessão não confirmada" });
+    await client.invoke(
+      new Api.auth.SignIn({
+        phoneNumber,
+        phoneCodeHash,
+        phoneCode,
+      })
+    );
 
-    await session.client.sendMessage(number, { message });
+    console.log("✅ Login Telegram bem-sucedido!");
 
-    sendWebhook(session.webhook, {
+    const sessionString = client.session.save();
+    saveSession(nome, sessionString);
+
+    delete tempLogins[phoneNumber];
+    sessions[nome] = { client, webhook, isConfirmed: true };
+
+    // Webhook de sucesso
+    await sendWebhook(webhook, {
+      acao: "nova_instancia",
+      nome,
+      status: "conectado",
+      stringSession: sessionString,
+    });
+
+    // Escutar mensagens
+    client.addEventHandler(
+      async (event) => {
+        const message = event.message;
+        if (!message) return;
+
+        messages.push(message); // Armazena a mensagem completa localmente
+
+        // Envia o objeto completo para a API
+        await sendWebhook(webhook, message);
+      },
+      new NewMessage({})
+    );
+
+    res.json({ status: "conectado", nome, sessionString });
+  } catch (err) {
+    if (err.error_message === "SESSION_PASSWORD_NEEDED" || err.errorMessage === "SESSION_PASSWORD_NEEDED") {
+      try {
+        await client.invoke(new Api.auth.CheckPassword({ password }));
+        const sessionString = client.session.save();
+        saveSession(nome, sessionString);
+        res.json({ status: "conectado_com_password", nome });
+      } catch (e) {
+        res.status(401).json({ error: "Senha incorreta" });
+      }
+    } else {
+      console.error("❌ Erro confirmar código:", err);
+      res.status(500).json({ error: "Falha ao confirmar código" });
+    }
+  }
+});
+
+/* -------------------- Recarregar sessões salvas -------------------- */
+(async () => {
+  const files = fs.readdirSync(SESSIONS_DIR);
+  for (const file of files) {
+    const nome = path.basename(file, ".session");
+    const sessionData = readSession(nome);
+    if (!sessionData) continue;
+
+    const client = new TelegramClient(new StringSession(sessionData), apiId, apiHash, { connectionRetries: 5 });
+    await client.connect();
+
+    sessions[nome] = { client, webhook: null, isConfirmed: true };
+    console.log(`♻️ Sessão restaurada: ${nome}`);
+  }
+})();
+
+/* -------------------- Função Auxiliar -------------------- */
+
+function buildInlineKeyboard(buttons) {
+  if (!buttons || !Array.isArray(buttons) || buttons.length === 0) return [];
+
+  return buttons.map((row) => 
+    new Api.KeyboardButtonRow({
+      buttons: row.map((btn) => {
+        if (btn.url) {
+          return new Api.KeyboardButtonUrl({
+            text: btn.text,
+            url: btn.url,
+          });
+        } else {
+          return new Api.KeyboardButtonCallback({
+            text: btn.text,
+            data: Buffer.from(btn.callback_data || btn.text, "utf-8"),
+          });
+        }
+      }),
+    })
+  );
+}
+
+
+/* -------------------- Enviar mensagem -------------------- */
+
+app.post("/send-message", async (req, res) => {
+  const { nome, number, userId, message } = req.body;
+  const session = sessions[nome];
+
+  if (!session) {
+    return res.status(400).json({ error: "Sessão não encontrada" });
+  }
+
+  try {
+    let entity;
+
+    if (number) {
+      // 🔹 Caso tenha número, formata corretamente
+      const formattedNumber = number.startsWith("+") ? number : `+${number}`;
+
+      try {
+        entity = await session.client.getEntity(formattedNumber);
+      } catch {
+        // Caso não exista, importa o contato
+        const result = await session.client.invoke(
+          new Api.contacts.ImportContacts({
+            contacts: [
+              new Api.InputPhoneContact({
+                clientId: Date.now(),
+                phone: formattedNumber,
+                firstName: "Contato",
+                lastName: "",
+              }),
+            ],
+          })
+        );
+
+        entity = result.users[0];
+      }
+    } else if (userId) {
+      // 🔹 Caso tenha apenas o ID do usuário
+      const userEntity = await session.client.getEntity(userId);
+
+      entity = new Api.InputPeerUser({
+        userId: BigInt(userEntity.id),
+        accessHash: userEntity.accessHash,
+      });
+    } else {
+      return res.status(400).json({
+        error: "É necessário informar 'number' ou 'userId' no corpo da requisição.",
+      });
+    }
+
+    // 🟩 Envia a mensagem
+    await session.client.sendMessage(entity, { message });
+
+    // 🔹 Envia webhook (se configurado)
+    await sendWebhook(session.webhook, {
       acao: "mensagem_enviada",
-      para: number,
+      para: number || userId,
       mensagem: message,
-      instancia: nome,
       data: new Date().toISOString(),
     });
 
@@ -169,29 +247,26 @@ app.post("/send-message", async (req, res) => {
   }
 });
 
-// Listar mensagens recebidas
+
+/* -------------------- Status da instância -------------------- */
+app.get("/status/:nome", (req, res) => {
+  const { nome } = req.params;
+  const session = sessions[nome];
+  if (!session) return res.status(404).json({ error: "Sessão não encontrada" });
+
+  res.json({
+    nome,
+    conectado: !!session.client.connected,
+    webhook: session.webhook,
+    isConfirmed: session.isConfirmed,
+  });
+});
+
+/* -------------------- Listar mensagens -------------------- */
 app.get("/received-messages", (req, res) => {
   res.json({ total: messages.length, mensagens: messages });
 });
 
-// Status da instância
-app.get("/status/:nome", (req, res) => {
-  try {
-    const { nome } = req.params;
-    const session = sessions[nome];
-    if (!session) return res.status(404).json({ error: "Sessão não encontrada" });
-
-    res.json({
-      nome,
-      conectado: !!session.client && session.client.connected,
-      webhook: session.webhook,
-      isConfirmed: session.isConfirmed,
-    });
-  } catch (err) {
-    console.error("❌ Erro ao verificar status:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
 
 /* -------------------- Iniciar servidor -------------------- */
 app.listen(PORT, () => console.log(`🚀 Servidor rodando em http://localhost:${PORT}`));
